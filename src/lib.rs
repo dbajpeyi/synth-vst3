@@ -152,7 +152,12 @@ struct Voice {
 }
 
 impl Voice {
-    fn process_adsr(&mut self, sample_rate: f32, amp_decay_ms: f32, amp_sustain_level: f32) {
+    fn process_adsr(
+        &mut self,
+        sample_rate: f32,
+        amp_decay_ms: f32,
+        amp_sustain_level: f32,
+    ) -> &mut Self {
         match self.env_state {
             ADSRState::ATTACK => {
                 if self.amp_envelope.steps_left() <= 0 {
@@ -168,10 +173,10 @@ impl Voice {
                     self.env_state = ADSRState::SUSTAIN;
                 }
             }
-            ADSRState::SUSTAIN => {
-            }
+            ADSRState::SUSTAIN => {}
             _ => {}
         }
+        self
     }
 }
 
@@ -520,13 +525,12 @@ impl Plugin for Synth {
                 // 0 and 1. When a note off event is received, this envelope will start fading out
                 // again. When it reaches 0, we will terminate the voice.
 
-                voice.process_adsr(
-                    sample_rate,
-                    self.params.amp_decay_ms.value(),
-                    self.params.amp_sustain_level.value(),
-                );
-
                 voice
+                    .process_adsr(
+                        sample_rate,
+                        self.params.amp_decay_ms.value(),
+                        self.params.amp_sustain_level.value(),
+                    )
                     .amp_envelope
                     .next_block(&mut voice_amp_envelope, block_len);
 
