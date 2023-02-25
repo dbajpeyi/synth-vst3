@@ -1,12 +1,12 @@
-use nih_plug::debug;
+// use nih_plug::debug;
 use nih_plug::prelude::*;
 use rand::Rng;
 use rand_pcg::Pcg32;
-use std::{f32::INFINITY, sync::Arc};
+use std::f32::consts::TAU;
+use std::sync::Arc;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
-const TAU: f32 = std::f32::consts::TAU;
 /// The number of simultaneous voices for this synth.
 const NUM_VOICES: u32 = 16;
 /// The maximum size of an audio block. We'll split up the audio in blocks and render smoothed
@@ -18,7 +18,7 @@ const MAX_BLOCK_SIZE: usize = 64;
 // correct parameter.
 const GAIN_POLY_MOD_ID: u32 = 0;
 
-const TABLE_LENGTH: usize = 1024;
+const TABLE_LENGTH: usize = 2048;
 
 /// A simple polyphonic synthesizer with support for CLAP's polyphonic modulation. See
 /// `NoteEvent::PolyModulation` for another source of information on how to use this.
@@ -67,6 +67,17 @@ enum Waveform {
     SQUARE,
 }
 
+#[derive(EnumIter, Enum, Debug, PartialEq, Clone, Copy)]
+enum FilterType {
+    #[id = "highpass"]
+    #[name = "highpass"]
+    HIGHPASS,
+
+    #[id = "lowpass"]
+    #[name = "lowpass"]
+    LOWPASS,
+}
+
 #[derive(Params)]
 struct PolyModSynthParams {
     /// A voice's gain. This can be polyphonically modulated.
@@ -88,6 +99,15 @@ struct PolyModSynthParams {
 
     #[id = "waveform"]
     waveform: EnumParam<Waveform>,
+
+    #[id = "filter_cutoff"]
+    filter_cutoff: FloatParam,
+
+    #[id = "filter_q"]
+    filter_q: FloatParam,
+
+    #[id = "type"]
+    filter_type: EnumParam<FilterType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Copy)]
@@ -170,6 +190,7 @@ impl Voice {
             ADSRState::DECAY => {
                 if self.amp_envelope.steps_left() <= 0 {
                     self.amp_envelope = Smoother::new(SmoothingStyle::None);
+                    self.amp_envelope.reset(amp_sustain_level);
                     self.env_state = ADSRState::SUSTAIN;
                 }
             }
@@ -264,6 +285,18 @@ impl Default for PolyModSynthParams {
             )
             .with_step_size(0.1),
             waveform: EnumParam::new("sine", Waveform::SINE),
+            filter_cutoff: FloatParam::new(
+                "Cutoff",
+                0.0,
+                FloatRange::Linear {
+                    min: 0.1,
+                    max: 5.0,
+                },
+            )
+            .with_step_size(0.1),
+            filter_q: FloatParam::new("Q", 0.0, FloatRange::Linear { min: 0.0, max: 100.0 })
+                .with_step_size(0.1),
+            filter_type: EnumParam::new("Highpass", FilterType::HIGHPASS),
         }
     }
 }
@@ -293,7 +326,7 @@ impl Plugin for Synth {
     fn initialize(
         &mut self,
         _bus_config: &BusConfig,
-        _buffer_config: &BufferConfig,
+        buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         self.generate_lookup_tables();
@@ -494,6 +527,11 @@ impl Plugin for Synth {
             // We'll start with silence, and then add the output from the active voices
             output[0][block_start..block_end].fill(0.0);
             output[1][block_start..block_end].fill(0.0);
+            let mut delay_buffer = [0.0; 4];
+            let mut b0   = 0.0;
+            let mut b1   = 0.0;
+            let mut b2   = 0.0;
+            let mut b3   = 0.0;
 
             // These are the smoothed global parameter values. These are used for voices that do not
             // have polyphonic modulation applied to them. With a plugin as simple as this it would
@@ -535,7 +573,7 @@ impl Plugin for Synth {
                     .next_block(&mut voice_amp_envelope, block_len);
 
                 for (value_idx, sample_idx) in (block_start..block_end).enumerate() {
-                    nih_log!("Steps left {}", voice.amp_envelope.steps_left());
+                    // nih_log!("Steps left {}", voice.amp_envelope.steps_left());
                     let amp = voice.velocity_sqrt * gain[value_idx] * voice_amp_envelope[value_idx];
                     let mut lookup_table = self
                         .lookup_tables
@@ -544,9 +582,15 @@ impl Plugin for Synth {
                         .find(|table| table.waveform == self.params.waveform.value())
                         .unwrap();
 
-                    let sample = lookup_table.get_sample(voice.phase) * amp;
-                    output[0][sample_idx] += sample;
-                    output[1][sample_idx] += sample;
+                    let sample = lookup_table.get_sample(voice.phase);
+                    // let s = process_1pole_tpt_lowpass(
+                    //     sample,
+                    //     self.params.filter_cutoff.value(),
+                    //     1.0 / sample_rate,
+                    //     &mut b0,
+                    // );
+                    output[0][sample_idx] += sample * amp;
+                    output[1][sample_idx] += sample * amp;
                     voice.phase += voice.phase_delta;
                     voice.phase %= lookup_table.table.len() as f32;
                 }
@@ -585,7 +629,6 @@ impl Plugin for Synth {
 
 impl Synth {
     fn generate_lookup_tables(&mut self) {
-        const TAU: f32 = std::f32::consts::TAU;
         for waveform in Waveform::iter() {
             match waveform {
                 Waveform::SINE => {
@@ -611,7 +654,7 @@ impl Synth {
                 Waveform::SQUARE => {
                     let mut square_table: Vec<f32> = Vec::with_capacity(TABLE_LENGTH);
                     for n in 0..TABLE_LENGTH {
-                        square_table.push(pulse(TAU * n as f32 / TABLE_LENGTH as f32, 0.10))
+                        square_table.push(pulse(TAU * n as f32 / TABLE_LENGTH as f32, 0.50))
                     }
                     self.lookup_tables.push(LookupTable {
                         waveform: Waveform::SQUARE,

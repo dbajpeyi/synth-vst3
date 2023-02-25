@@ -11,12 +11,14 @@ description = "A short description of your plugin"
 members = ["xtask"]
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 
 [dependencies]
+libm = "0.2.6"
 # Remove the `assert_process_allocs` feature to allow allocations on the audio
 # thread in debug builds.
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
+num-traits = "0.2.15"
 # Uncomment the below line to disable the on-by-default VST3 feature to remove
 # the GPL compatibility requirement
 # nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", default_features = false, features = ["assert_process_allocs"] }
@@ -24,7 +26,7 @@ rand = "0.8.5"
 rand_pcg = "0.3.1"
 strum = "0.24"
 strum_macros = "0.24"
-
+synfx-dsp = "0.5.5"
 
 [profile.release]
 lto = "thin"
