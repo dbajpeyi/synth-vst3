@@ -233,7 +233,7 @@ impl Default for SynthParams {
         Self {
             gain: FloatParam::new(
                 "Gain",
-                util::db_to_gain(-12.0),
+                util::db_to_gain(0.0),
                 // Because we're representing gain as decibels the range is already logarithmic
                 FloatRange::Linear {
                     min: util::db_to_gain(-36.0),
@@ -267,7 +267,7 @@ impl Default for SynthParams {
                 200.0,
                 FloatRange::Skewed {
                     min: 0.1,
-                    max: 5000.0,
+                    max: 3000.0,
                     factor: FloatRange::skew_factor(-1.0),
                 },
             )
@@ -281,7 +281,7 @@ impl Default for SynthParams {
                 100.0,
                 FloatRange::Skewed {
                     min: 0.0,
-                    max: 20000.0,
+                    max: 7000.0,
                     factor: FloatRange::skew_factor(-1.0),
                 },
             )
@@ -312,10 +312,10 @@ impl Default for SynthParams {
             .with_step_size(1.0),
             filter_q: FloatParam::new(
                 "Q",
-                0.1,
+                0.0,
                 FloatRange::Skewed {
-                    min: 0.1,
-                    max: 0.99,
+                    min: 0.0,
+                    max: 1.0,
                     factor: FloatRange::skew_factor(0.1),
                 },
             )
