@@ -1,11 +1,15 @@
+#![feature(portable_simd)]
 // use nih_plug::debug;
+use core_simd::simd::f32x4;
 use nih_plug::prelude::*;
 use rand::Rng;
 use rand_pcg::Pcg32;
-use std::f32::consts::TAU;
+use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
+use va_filter::filter_params::{FilterParams};
+use va_filter::*;
 
 /// The number of simultaneous voices for this synth.
 const NUM_VOICES: u32 = 16;
@@ -18,13 +22,13 @@ const MAX_BLOCK_SIZE: usize = 64;
 // correct parameter.
 const GAIN_POLY_MOD_ID: u32 = 0;
 
-const TABLE_LENGTH: usize = 2048;
+const TABLE_LENGTH: usize = 2048 * 4;
 
 /// A simple polyphonic synthesizer with support for CLAP's polyphonic modulation. See
 /// `NoteEvent::PolyModulation` for another source of information on how to use this.
 ///
 pub struct Synth {
-    params: Arc<PolyModSynthParams>,
+    params: Arc<SynthParams>,
 
     /// A pseudo-random number generator. This will always be reseeded with the same seed when the
     /// synth is reset. That way the output is deterministic when rendering multiple times.
@@ -36,6 +40,9 @@ pub struct Synth {
     next_internal_voice_id: u64,
 
     lookup_tables: Vec<LookupTable>,
+    svf_stereo: filter::svf::Svf,
+    should_update_filter: Arc<std::sync::atomic::AtomicBool>,
+    filter_params: Arc<FilterParams>,
 }
 
 fn sawtooth(phase: f32) -> f32 {
@@ -79,7 +86,7 @@ enum FilterType {
 }
 
 #[derive(Params)]
-struct PolyModSynthParams {
+struct SynthParams {
     /// A voice's gain. This can be polyphonically modulated.
     #[id = "gain"]
     gain: FloatParam,
@@ -203,19 +210,25 @@ impl Voice {
 
 impl Default for Synth {
     fn default() -> Self {
+        let should_update_filter = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let filter_params = Arc::new(FilterParams::new(should_update_filter.clone()));
+        let svf_stereo = filter::svf::Svf::new(filter_params.clone());
         Self {
-            params: Arc::new(PolyModSynthParams::default()),
+            params: Arc::new(SynthParams::default()),
 
+            filter_params,
             prng: Pcg32::new(420, 1337),
             // `[None; N]` requires the `Some(T)` to be `Copy`able
             voices: [0; NUM_VOICES as usize].map(|_| None),
             next_internal_voice_id: 0,
             lookup_tables: Vec::with_capacity(4),
+            svf_stereo,
+            should_update_filter: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
 
-impl Default for PolyModSynthParams {
+impl Default for SynthParams {
     fn default() -> Self {
         Self {
             gain: FloatParam::new(
@@ -288,14 +301,25 @@ impl Default for PolyModSynthParams {
             filter_cutoff: FloatParam::new(
                 "Cutoff",
                 0.0,
-                FloatRange::Linear {
+                FloatRange::Skewed {
                     min: 0.1,
-                    max: 5.0,
+                    max: 22000.0,
+                    factor: FloatRange::skew_factor(-1.0),
                 },
             )
-            .with_step_size(0.1),
-            filter_q: FloatParam::new("Q", 0.0, FloatRange::Linear { min: 0.0, max: 100.0 })
-                .with_step_size(0.1),
+            .with_smoother(SmoothingStyle::Logarithmic(5.0))
+            .with_unit(" Hz")
+            .with_step_size(1.0),
+            filter_q: FloatParam::new(
+                "Q",
+                0.1,
+                FloatRange::Skewed {
+                    min: 0.1,
+                    max: 0.99,
+                    factor: FloatRange::skew_factor(0.1),
+                },
+            )
+            .with_step_size(0.01),
             filter_type: EnumParam::new("Highpass", FilterType::HIGHPASS),
         }
     }
@@ -342,6 +366,7 @@ impl Plugin for Synth {
 
         self.voices.fill(None);
         self.next_internal_voice_id = 0;
+        self.svf_stereo.reset();
     }
 
     fn process(
@@ -362,6 +387,20 @@ impl Plugin for Synth {
         let mut next_event = context.next_event();
         let mut block_start: usize = 0;
         let mut block_end: usize = MAX_BLOCK_SIZE.min(num_samples);
+        if self
+            .should_update_filter
+            .compare_exchange(
+                true,
+                false,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.svf_stereo.update();
+            self.filter_params.update_g(self.params.filter_cutoff.value());
+            self.filter_params.set_resonances(self.params.filter_q.value());
+        }
         while block_start < num_samples {
             // First of all, handle all note events that happen at the start of the block, and cut
             // the block short if another event happens before the end of it. To handle polyphonic
@@ -527,11 +566,6 @@ impl Plugin for Synth {
             // We'll start with silence, and then add the output from the active voices
             output[0][block_start..block_end].fill(0.0);
             output[1][block_start..block_end].fill(0.0);
-            let mut delay_buffer = [0.0; 4];
-            let mut b0   = 0.0;
-            let mut b1   = 0.0;
-            let mut b2   = 0.0;
-            let mut b3   = 0.0;
 
             // These are the smoothed global parameter values. These are used for voices that do not
             // have polyphonic modulation applied to them. With a plugin as simple as this it would
@@ -562,7 +596,6 @@ impl Plugin for Synth {
                 // This is an exponential smoother repurposed as an AR envelope with values between
                 // 0 and 1. When a note off event is received, this envelope will start fading out
                 // again. When it reaches 0, we will terminate the voice.
-
                 voice
                     .process_adsr(
                         sample_rate,
@@ -572,28 +605,42 @@ impl Plugin for Synth {
                     .amp_envelope
                     .next_block(&mut voice_amp_envelope, block_len);
 
-                for (value_idx, sample_idx) in (block_start..block_end).enumerate() {
-                    // nih_log!("Steps left {}", voice.amp_envelope.steps_left());
-                    let amp = voice.velocity_sqrt * gain[value_idx] * voice_amp_envelope[value_idx];
-                    let mut lookup_table = self
-                        .lookup_tables
-                        .iter()
-                        .cloned()
-                        .find(|table| table.waveform == self.params.waveform.value())
-                        .unwrap();
+                let mut lookup_table = self
+                    .lookup_tables
+                    .iter()
+                    .cloned()
+                    .find(|table| table.waveform == self.params.waveform.value())
+                    .unwrap();
 
+                for (value_idx, sample_idx) in (block_start..block_end).enumerate() {
                     let sample = lookup_table.get_sample(voice.phase);
-                    // let s = process_1pole_tpt_lowpass(
-                    //     sample,
-                    //     self.params.filter_cutoff.value(),
-                    //     1.0 / sample_rate,
-                    //     &mut b0,
-                    // );
-                    output[0][sample_idx] += sample * amp;
-                    output[1][sample_idx] += sample * amp;
+                    let amp = voice.velocity_sqrt * gain[value_idx] * voice_amp_envelope[value_idx];
+                    for channel in 0..2 {
+                        output[channel][sample_idx] += sample * amp;
+                    }
                     voice.phase += voice.phase_delta;
                     voice.phase %= lookup_table.table.len() as f32;
                 }
+            }
+
+            for sample_idx in block_start..block_end {
+                if self.params.filter_cutoff.smoothed.is_smoothing() {
+                    let cut_smooth = self.params.filter_cutoff.smoothed.next();
+                    self.filter_params.update_g(cut_smooth);
+                    self.svf_stereo.update();
+                }
+                if self.params.filter_q.smoothed.is_smoothing() {
+                    let q_smooth = self.params.filter_q.smoothed.next();
+                    self.filter_params.set_resonances(q_smooth);
+                    self.svf_stereo.update();
+                }
+                let in_l = output[0][sample_idx];
+                let in_r = output[1][sample_idx];
+                let mut frame = f32x4::from_array([in_l, in_r, 0.0, 0.0]);
+                let processed = self.svf_stereo.process(frame);
+                let frame_out = *processed.as_array();
+                output[0][sample_idx] = frame_out[0];
+                output[1][sample_idx] = frame_out[1];
             }
 
             // Terminate voices whose release period has fully ended. This could be done as part of
@@ -673,7 +720,7 @@ impl Synth {
                 }
             }
         }
-        nih_debug_assert_eq!(self.lookup_tables.len(), 4);
+        // nih_debug_assert_eq!(self.lookup_tables.len(), 4);
     }
     /// Get the index of a voice by its voice ID, if the voice exists. This does not immediately
     /// reutnr a reference to the voice to avoid lifetime issues.
