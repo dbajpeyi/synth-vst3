@@ -4,7 +4,7 @@ use core_simd::simd::f32x4;
 use nih_plug::prelude::*;
 use rand::Rng;
 use rand_pcg::Pcg32;
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::{TAU};
 use std::sync::Arc;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
@@ -333,8 +333,11 @@ impl Plugin for Synth {
 
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
-    const DEFAULT_INPUT_CHANNELS: u32 = 2;
-    const DEFAULT_OUTPUT_CHANNELS: u32 = 2;
+    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+        main_input_channels: NonZeroU32::new(2),
+        main_output_channels: NonZeroU32::new(2),
+        ..AudioIOLayout::const_default()
+    }];
 
     // We won't need any MIDI CCs here, we just want notes and polyphonic modulation
     const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
@@ -349,8 +352,8 @@ impl Plugin for Synth {
 
     fn initialize(
         &mut self,
-        _bus_config: &BusConfig,
-        buffer_config: &BufferConfig,
+        _audio_io_layout: &AudioIOLayout,
+        _buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         self.generate_lookup_tables();
@@ -636,7 +639,7 @@ impl Plugin for Synth {
                 }
                 let in_l = output[0][sample_idx];
                 let in_r = output[1][sample_idx];
-                let mut frame = f32x4::from_array([in_l, in_r, 0.0, 0.0]);
+                let frame = f32x4::from_array([in_l, in_r, 0.0, 0.0]);
                 let processed = self.svf_stereo.process(frame);
                 let frame_out = *processed.as_array();
                 output[0][sample_idx] = frame_out[0];
