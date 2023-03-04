@@ -1,15 +1,19 @@
 #![feature(portable_simd)]
 // use nih_plug::debug;
 use core_simd::simd::f32x4;
+use envelope::Envelope;
 use nih_plug::prelude::*;
 use rand::Rng;
 use rand_pcg::Pcg32;
-use std::f32::consts::{TAU};
+use std::env;
+use std::f32::consts::TAU;
 use std::sync::Arc;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
-use va_filter::filter_params::{FilterParams};
+use va_filter::filter_params::FilterParams;
 use va_filter::*;
+
+mod envelope;
 
 /// The number of simultaneous voices for this synth.
 const NUM_VOICES: u32 = 16;
@@ -43,6 +47,7 @@ pub struct Synth {
     svf_stereo: filter::svf::Svf,
     should_update_filter: Arc<std::sync::atomic::AtomicBool>,
     filter_params: Arc<FilterParams>,
+    amp_envelope: Envelope,
 }
 
 fn sawtooth(phase: f32) -> f32 {
@@ -117,14 +122,6 @@ struct SynthParams {
     filter_type: EnumParam<FilterType>,
 }
 
-#[derive(Debug, Clone, PartialEq, Copy)]
-enum ADSRState {
-    ATTACK,
-    DECAY,
-    SUSTAIN,
-    RELEASE,
-}
-
 #[derive(Clone)]
 struct LookupTable {
     waveform: Waveform,
@@ -167,45 +164,10 @@ struct Voice {
     /// Since we don't support pitch expressions or pitch bend, this value stays constant for the
     /// duration of the voice.
     phase_delta: f32,
-    /// Whether the key has been released and the voice is in its release stage. The voice will be
-    /// terminated when the amplitude envelope hits 0 while the note is releasing.
-    env_state: ADSRState,
-    /// Fades between 0 and 1 with timings based on the global attack and release settings.
-    amp_envelope: Smoother<f32>,
 
     /// If this voice has polyphonic gain modulation applied, then this contains the normalized
     /// offset and a smoother.
     voice_gain: Option<(f32, Smoother<f32>)>,
-}
-
-impl Voice {
-    fn process_adsr(
-        &mut self,
-        sample_rate: f32,
-        amp_decay_ms: f32,
-        amp_sustain_level: f32,
-    ) -> &mut Self {
-        match self.env_state {
-            ADSRState::ATTACK => {
-                if self.amp_envelope.steps_left() <= 0 {
-                    self.amp_envelope = Smoother::new(SmoothingStyle::Exponential(amp_decay_ms));
-                    self.amp_envelope.reset(1.0);
-                    self.amp_envelope.set_target(sample_rate, amp_sustain_level);
-                    self.env_state = ADSRState::DECAY;
-                }
-            }
-            ADSRState::DECAY => {
-                if self.amp_envelope.steps_left() <= 0 {
-                    self.amp_envelope = Smoother::new(SmoothingStyle::None);
-                    self.amp_envelope.reset(amp_sustain_level);
-                    self.env_state = ADSRState::SUSTAIN;
-                }
-            }
-            ADSRState::SUSTAIN => {}
-            _ => {}
-        }
-        self
-    }
 }
 
 impl Default for Synth {
@@ -224,6 +186,7 @@ impl Default for Synth {
             lookup_tables: Vec::with_capacity(4),
             svf_stereo,
             should_update_filter: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            amp_envelope: Envelope::default(),
         }
     }
 }
@@ -401,8 +364,10 @@ impl Plugin for Synth {
             .is_ok()
         {
             self.svf_stereo.update();
-            self.filter_params.update_g(self.params.filter_cutoff.value());
-            self.filter_params.set_resonances(self.params.filter_q.value());
+            self.filter_params
+                .update_g(self.params.filter_cutoff.value());
+            self.filter_params
+                .set_resonances(self.params.filter_q.value());
         }
         while block_start < num_samples {
             // First of all, handle all note events that happen at the start of the block, and cut
@@ -426,21 +391,20 @@ impl Plugin for Synth {
                                 note,
                                 velocity,
                             } => {
+                                nih_log!("Note On");
                                 let initial_phase: f32 = self.prng.gen();
-                                // This starts with the attack portion of the amplitude envelope
-                                let amp_envelope = Smoother::new(SmoothingStyle::Exponential(
-                                    self.params.amp_attack_ms.value(),
+                                self.amp_envelope.set_value(Smoother::new(
+                                    SmoothingStyle::Exponential(self.params.amp_attack_ms.value()),
                                 ));
-                                amp_envelope.reset(0.0);
-                                amp_envelope.set_target(sample_rate, 1.0);
-
+                                self.amp_envelope.set_state(envelope::ADSRState::ATTACK);
+                                self.amp_envelope.reset(0.1);
+                                self.amp_envelope.set_target(sample_rate, 1.0);
                                 let voice =
                                     self.start_voice(context, timing, voice_id, channel, note);
                                 voice.velocity_sqrt = velocity.sqrt();
                                 voice.phase = initial_phase;
                                 voice.phase_delta = util::midi_note_to_freq(note)
                                     * (TABLE_LENGTH as f32 / sample_rate);
-                                voice.amp_envelope = amp_envelope;
                             }
                             NoteEvent::NoteOff {
                                 timing: _,
@@ -449,7 +413,7 @@ impl Plugin for Synth {
                                 note,
                                 velocity: _,
                             } => {
-                                self.start_release_for_voices(sample_rate, voice_id, channel, note)
+                                self.start_release_for_voices(sample_rate, voice_id, channel, note);
                             }
                             NoteEvent::Choke {
                                 timing,
@@ -578,12 +542,16 @@ impl Plugin for Synth {
             let block_len = block_end - block_start;
             let mut gain = [0.0; MAX_BLOCK_SIZE];
             let mut voice_gain = [0.0; MAX_BLOCK_SIZE];
-            let mut voice_amp_envelope = [0.0; MAX_BLOCK_SIZE];
             self.params.gain.smoothed.next_block(&mut gain, block_len);
 
-            // ADSR state handling
-            // TODO: Some form of band limiting
-            // TODO: Filter
+            let voice_amp_envelope = self.amp_envelope.process(
+                sample_rate,
+                self.params.amp_decay_ms.smoothed.next(),
+                self.params.amp_release_ms.smoothed.next(),
+                self.params.amp_sustain_level.smoothed.next(),
+                block_len,
+            );
+
             for voice in self.voices.iter_mut().filter_map(|v| v.as_mut()) {
                 // Depending on whether the voice has polyphonic modulation applied to it,
                 // either the global parameter values are used, or the voice's smoother is used
@@ -596,18 +564,6 @@ impl Plugin for Synth {
                     None => &gain,
                 };
 
-                // This is an exponential smoother repurposed as an AR envelope with values between
-                // 0 and 1. When a note off event is received, this envelope will start fading out
-                // again. When it reaches 0, we will terminate the voice.
-                voice
-                    .process_adsr(
-                        sample_rate,
-                        self.params.amp_decay_ms.value(),
-                        self.params.amp_sustain_level.value(),
-                    )
-                    .amp_envelope
-                    .next_block(&mut voice_amp_envelope, block_len);
-
                 let mut lookup_table = self
                     .lookup_tables
                     .iter()
@@ -617,7 +573,7 @@ impl Plugin for Synth {
 
                 for (value_idx, sample_idx) in (block_start..block_end).enumerate() {
                     let sample = lookup_table.get_sample(voice.phase);
-                    let amp = voice.velocity_sqrt * gain[value_idx] * voice_amp_envelope[value_idx];
+                    let amp = voice.velocity_sqrt * gain[value_idx];
                     for channel in 0..2 {
                         output[channel][sample_idx] += sample * amp;
                     }
@@ -625,6 +581,13 @@ impl Plugin for Synth {
                     voice.phase %= lookup_table.table.len() as f32;
                 }
             }
+
+            for (value_idx, sample_idx) in (block_start..block_end).enumerate() {
+                for channel in 0..2 {
+                    output[channel][sample_idx] *= voice_amp_envelope[value_idx];
+                }
+            }
+            // nih_log!("{:?}", self.amp_envelope.state());
 
             for sample_idx in block_start..block_end {
                 if self.params.filter_cutoff.smoothed.is_smoothing() {
@@ -648,23 +611,22 @@ impl Plugin for Synth {
 
             // Terminate voices whose release period has fully ended. This could be done as part of
             // the previous loop but this is simpler.
-            for voice in self.voices.iter_mut() {
-                match voice {
-                    Some(v)
-                        if v.env_state == ADSRState::RELEASE
-                            && v.amp_envelope.previous_value() == 0.0 =>
-                    {
-                        // This event is very important, as it allows the host to manage its own modulation
-                        // voices
-                        context.send_event(NoteEvent::VoiceTerminated {
-                            timing: block_end as u32,
-                            voice_id: Some(v.voice_id),
-                            channel: v.channel,
-                            note: v.note,
-                        });
-                        *voice = None;
+            if self.amp_envelope.state() == envelope::ADSRState::RELEASE
+                && self.amp_envelope.value().previous_value() == 0.0
+            {
+                for voice in self.voices.iter_mut() {
+                    match voice {
+                        Some(v) => {
+                            context.send_event(NoteEvent::VoiceTerminated {
+                                timing: block_end as u32,
+                                voice_id: Some(v.voice_id),
+                                channel: v.channel,
+                                note: v.note,
+                            });
+                            *voice = None;
+                        }
+                        _ => (),
                     }
-                    _ => (),
                 }
             }
 
@@ -749,12 +711,8 @@ impl Synth {
             channel,
             note,
             velocity_sqrt: 1.0,
-
             phase: 0.0,
             phase_delta: 0.0,
-            env_state: ADSRState::ATTACK,
-            amp_envelope: Smoother::none(),
-
             voice_gain: None,
         };
         self.next_internal_voice_id = self.next_internal_voice_id.wrapping_add(1);
@@ -795,8 +753,6 @@ impl Synth {
         }
     }
 
-    /// Start the release process for one or more voice by changing their amplitude envelope. If
-    /// `voice_id` is not provided, then this will terminate all matching voices.
     fn start_release_for_voices(
         &mut self,
         sample_rate: f32,
@@ -804,38 +760,34 @@ impl Synth {
         channel: u8,
         note: u8,
     ) {
-        for voice in self.voices.iter_mut() {
-            match voice {
-                Some(Voice {
-                    voice_id: candidate_voice_id,
-                    channel: candidate_channel,
-                    note: candidate_note,
-                    env_state,
-                    amp_envelope,
-                    ..
-                }) if voice_id == Some(*candidate_voice_id)
-                    || (channel == *candidate_channel && note == *candidate_note) =>
-                {
-                    *env_state = ADSRState::RELEASE;
-                    amp_envelope.style =
-                        SmoothingStyle::Exponential(self.params.amp_release_ms.value());
-                    amp_envelope.set_target(sample_rate, 0.0);
-
-                    // If this targetted a single voice ID, we're done here. Otherwise there may be
-                    // multiple overlapping voices as we enabled support for that in the
-                    // `PolyModulationConfig`.
-                    if voice_id.is_some() {
-                        return;
-                    }
-                }
-                _ => (),
-            }
-        }
+        self.amp_envelope
+            .set_value(Smoother::new(SmoothingStyle::Exponential(
+                self.params.amp_release_ms.smoothed.next(),
+            )));
+        self.amp_envelope.set_target(sample_rate, 0.0);
+        self.amp_envelope.set_state(envelope::ADSRState::RELEASE);
+        // for voice in self.voices.iter_mut() {
+        //     match voice {
+        //         Some(Voice {
+        //             voice_id: candidate_voice_id,
+        //             channel: candidate_channel,
+        //             note: candidate_note,
+        //             ..
+        //         }) if voice_id == Some(*candidate_voice_id)
+        //             || (channel == *candidate_channel && note == *candidate_note) =>
+        //         {
+        //             // If this targetted a single voice ID, we're done here. Otherwise there may be
+        //             // multiple overlapping voices as we enabled support for that in the
+        //             // `PolyModulationConfig`.
+        //             if voice_id.is_some() {
+        //                 return;
+        //             }
+        //         }
+        //         _ => (),
+        //     }
+        // }
     }
 
-    /// Immediately terminate one or more voice, removing it from the pool and informing the host
-    /// that the voice has ended. If `voice_id` is not provided, then this will terminate all
-    /// matching voices.
     fn choke_voices(
         &mut self,
         context: &mut impl ProcessContext<Self>,
