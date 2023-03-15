@@ -1,6 +1,6 @@
 # Synth
 
-# Building
+## Building
 
 After installing [Rust](https://rustup.rs/), you can compile Synth as follows:
 
