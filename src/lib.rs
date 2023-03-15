@@ -2,13 +2,14 @@
 // use nih_plug::debug;
 use core_simd::simd::f32x4;
 use nih_plug::prelude::*;
+use num_traits::Float;
 use rand::Rng;
 use rand_pcg::Pcg32;
-use std::f32::consts::{TAU};
+use std::f32::consts::TAU;
 use std::sync::Arc;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
-use va_filter::filter_params::{FilterParams};
+use va_filter::filter_params::FilterParams;
 use va_filter::*;
 
 /// The number of simultaneous voices for this synth.
@@ -16,6 +17,8 @@ const NUM_VOICES: u32 = 16;
 /// The maximum size of an audio block. We'll split up the audio in blocks and render smoothed
 /// values to buffers since these values may need to be reused for multiple voices.
 const MAX_BLOCK_SIZE: usize = 64;
+
+const NUM_OSC_PER_VOICE: usize = 2;
 
 // Polyphonic modulation works by assigning integer IDs to parameters. Pattern matching on these in
 // `PolyModulation` and `MonoAutomation` events makes it possible to easily link these events to the
@@ -104,8 +107,14 @@ struct SynthParams {
     #[id = "amp_release"]
     amp_release_ms: FloatParam,
 
-    #[id = "waveform"]
-    waveform: EnumParam<Waveform>,
+    #[id = "waveform_1"]
+    oscillator_1_waveform: EnumParam<Waveform>,
+
+    #[id = "waveform_2"]
+    oscillator_2_waveform: EnumParam<Waveform>,
+
+    #[id = "waveform_blend"]
+    waveform_blend: FloatParam,
 
     #[id = "filter_cutoff"]
     filter_cutoff: FloatParam,
@@ -125,7 +134,12 @@ enum ADSRState {
     RELEASE,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
+struct Oscillator {
+    lookupTable: LookupTable,
+}
+
+#[derive(Clone, Debug)]
 struct LookupTable {
     waveform: Waveform,
     table: Vec<f32>,
@@ -233,7 +247,7 @@ impl Default for SynthParams {
         Self {
             gain: FloatParam::new(
                 "Gain",
-                util::db_to_gain(-12.0),
+                util::db_to_gain(0.0),
                 // Because we're representing gain as decibels the range is already logarithmic
                 FloatRange::Linear {
                     min: util::db_to_gain(-36.0),
@@ -267,7 +281,7 @@ impl Default for SynthParams {
                 200.0,
                 FloatRange::Skewed {
                     min: 0.1,
-                    max: 5000.0,
+                    max: 3000.0,
                     factor: FloatRange::skew_factor(-1.0),
                 },
             )
@@ -281,7 +295,7 @@ impl Default for SynthParams {
                 100.0,
                 FloatRange::Skewed {
                     min: 0.0,
-                    max: 20000.0,
+                    max: 7000.0,
                     factor: FloatRange::skew_factor(-1.0),
                 },
             )
@@ -297,7 +311,13 @@ impl Default for SynthParams {
                 },
             )
             .with_step_size(0.1),
-            waveform: EnumParam::new("sine", Waveform::SINE),
+            oscillator_1_waveform: EnumParam::new("Oscillator A", Waveform::SINE),
+            oscillator_2_waveform: EnumParam::new("Oscillator B", Waveform::SAW),
+            waveform_blend: FloatParam::new(
+                "Blend",
+                0.5,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            ),
             filter_cutoff: FloatParam::new(
                 "Cutoff",
                 0.0,
@@ -312,10 +332,10 @@ impl Default for SynthParams {
             .with_step_size(1.0),
             filter_q: FloatParam::new(
                 "Q",
-                0.1,
+                0.0,
                 FloatRange::Skewed {
-                    min: 0.1,
-                    max: 0.99,
+                    min: 0.0,
+                    max: 1.0,
                     factor: FloatRange::skew_factor(0.1),
                 },
             )
@@ -401,8 +421,10 @@ impl Plugin for Synth {
             .is_ok()
         {
             self.svf_stereo.update();
-            self.filter_params.update_g(self.params.filter_cutoff.value());
-            self.filter_params.set_resonances(self.params.filter_q.value());
+            self.filter_params
+                .update_g(self.params.filter_cutoff.value());
+            self.filter_params
+                .set_resonances(self.params.filter_q.value());
         }
         while block_start < num_samples {
             // First of all, handle all note events that happen at the start of the block, and cut
@@ -608,21 +630,32 @@ impl Plugin for Synth {
                     .amp_envelope
                     .next_block(&mut voice_amp_envelope, block_len);
 
-                let mut lookup_table = self
+                let mut lookup_table_oscillator_1 = self
                     .lookup_tables
                     .iter()
                     .cloned()
-                    .find(|table| table.waveform == self.params.waveform.value())
+                    .find(|table| table.waveform == self.params.oscillator_1_waveform.value())
                     .unwrap();
 
+                let mut lookup_table_oscillator_2 = self
+                    .lookup_tables
+                    .iter()
+                    .cloned()
+                    .find(|table| table.waveform == self.params.oscillator_2_waveform.value())
+                    .unwrap();
+
+                let blend_value = self.params.waveform_blend.smoothed.next();
+
                 for (value_idx, sample_idx) in (block_start..block_end).enumerate() {
-                    let sample = lookup_table.get_sample(voice.phase);
+                    let sample_1 = lookup_table_oscillator_1.get_sample(voice.phase);
+                    let sample_2 = lookup_table_oscillator_2.get_sample(voice.phase);
+                    let sample = sample_1 * (1.0 - blend_value) + sample_2 * blend_value;
                     let amp = voice.velocity_sqrt * gain[value_idx] * voice_amp_envelope[value_idx];
                     for channel in 0..2 {
                         output[channel][sample_idx] += sample * amp;
                     }
                     voice.phase += voice.phase_delta;
-                    voice.phase %= lookup_table.table.len() as f32;
+                    voice.phase %= lookup_table_oscillator_1.table.len() as f32;
                 }
             }
 
